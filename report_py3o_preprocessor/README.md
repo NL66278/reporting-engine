@@ -97,6 +97,20 @@ with the py3o link element). This lets you write::
 and it correctly produces a standalone py3o "for" link paragraph — no special
 LibreOffice formatters required. ``{{ … }}`` and ``{# … #}`` are always inline.
 
+Formatting runs inside tokens (LibreOffice autocorrect)
+=======================================================
+
+LibreOffice frequently inserts ``<text:span>`` formatting runs *inside* a
+token you typed (autocorrect on underscores, spell-check marks, IME
+recomposition, …) which would split ``{{ o_format_date(object.date_created) }}`` across multiple XML
+elements. The preprocessor concatenates each paragraph's full text before
+tokenizing, so fragmented tokens still compile correctly. The trade-off is
+that formatting runs *inside* a token are flattened on output — the
+substituted value will inherit the paragraph's base style. This is rarely an
+issue in practice (a single substituted value rarely needs internal styling);
+the preprocessor emits an ``info``-level lint diagnostic when it happens so
+you know.
+
 How to use it
 =============
 
@@ -139,7 +153,7 @@ expressions:
 * ``display_address(partner)``
 * ``format_multiline_value(string)`` — emits ODF ``<text:line-break/>`` for ``\n``
 * ``html_sanitize(string)``, ``b64decode(bytes)``
-* ``objects`` — the recordset the report was launched on (``object`` for single-record reports; check the report action's binding model)
+* ``objects`` — the recordset the report was launched on. Iterate it with ``{% for object in objects %}`` to bind a single record so its fields are accessible as ``{{ object.<field> }}``.
 
 Format functions from py3o.template itself:
 
@@ -164,6 +178,16 @@ Limitations in this version (19.0.1.0.0)
   uses today. This module honours the surrounding structure py3o expects; see
   the upstream docs.
 
+Examples
+========
+
+``examples/contacts_and_children.odt`` is a worked example: it iterates the
+report's ``objects`` recordset with ``{% for object in objects %}``, prints
+each contact's name and creation date (``{{ object.name }}``,
+``{{ o_format_date(object.date_created) }}``), and renders a child-contacts
+table guarded by ``{% if object.child_ids %}`` with an inner
+``{% for child in object.child_ids %}``.
+
 Tests
 =====
 
@@ -175,9 +199,10 @@ Odoo dependency. Unit tests run against Python 3.13 + lxml + ``py3o.template``::
 
 Expect ``ALL TESTS PASSED``. Tests cover tokenizer behaviour, the block rule,
 each token kind (``{{ }}``/``{% for %}``/``{% if %}``/``{% function %}``/``{# #}``),
-unbalanced-directive detection, the ``{% elif %}`` refusal, and an
-end-to-end acceptance test that feeds the compiled ``.odt`` to
-``py3o.template.Template.get_all_user_python_expression()``.
+unbalanced-directive detection, the ``{% elif %}`` refusal, a regression test
+for ``{{ … }}`` tokens split across ``<text:span>`` formatting runs (LibreOffice
+autocorrect), and an end-to-end acceptance test that feeds the compiled
+``.odt`` to ``py3o.template.Template.get_all_user_python_expression()``.
 
 Licensing
 =========

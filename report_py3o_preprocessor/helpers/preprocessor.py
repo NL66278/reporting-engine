@@ -211,15 +211,21 @@ def _transform_tree(root: etree._Element, state: _State) -> None:
     for paragraph in list(body.iter(_qn("text", "p"))) + list(body.iter(_qn("text", "h"))):
         _handle_block_directive_paragraph(paragraph, state)
 
-    # 2. Inline replacement: ``{{ }}``/``{% %}``/``{# #}`` inside .text and
-    #    .tail strings of every element in the body.
-    for element in list(body.iter()):
-        if _is_text_node_carrier(element):
-            _handle_inline_tokens(element, "text", state)
-        # tail belongs to the element's previous sibling context; handled via
-        # the parent walk below.
-    for element in list(body.iter()):
-        _handle_inline_tokens(element, "tail", state)
+    # 2. Inline replacement: walk every paragraph (``<text:p>`` / ``<text:h>``)
+    #    and operate on the *flattened* text of the whole paragraph, not the
+    #    per-element ``.text``/``.tail`` strings. This is intentional and
+    #    necessary: LibreOffice frequently inserts ``<text:span>`` formatting
+    #    runs *inside* a token the author typed — e.g. marking up an
+    #    autocorrected ``_`` or a spell-check suggestion — which would split
+    #    a ``{{ create_date }}`` token across multiple XML elements and break
+    #    any per-element tokenizer. By concatenating the paragraph's full text
+    #    first, we see the tokens as the author intended. The cost is that
+    #    formatting runs *inside* a token (which carry no semantic meaning for
+    #    a substituted value anyway) are flattened; formatting on literal
+    #    text around tokens is preserved (paragraph is rewritten only when
+    #    tokens are present).
+    for paragraph in list(body.iter(_qn("text", "p"))) + list(body.iter(_qn("text", "h"))):
+        _handle_inline_paragraph(paragraph, state)
 
     # 3. Forward block-direction balance check (raise lint issues for
     #    unterminated ``{% for %}``/``{% if %}``).
@@ -232,11 +238,6 @@ def _transform_tree(root: etree._Element, state: _State) -> None:
 def _find_body(root: etree._Element) -> etree._Element | None:
     body = root.find(_qn("office", "body"))
     return body
-
-
-def _is_text_node_carrier(_el: etree._Element) -> bool:
-    """All elements can carry ``.text``; we only restrict via the iter walk."""
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -320,48 +321,65 @@ def _make_py3o_link(payload: str, state: _State) -> etree._Element:
         href = "py3o:///" + payload.lstrip("/")
     else:
         href = "py3o://" + urllib.parse.quote(payload, safe="=(),\"' ")
+    # NOTE: no ``nsmap=`` — see comment in ``_make_user_field_get``. The
+    # xlink namespace is declared on the parent tree (parsed from the
+    # original .odt) and inherited automatically.
     link = etree.Element(
         _qn("text", "a"),
         attrib={
             _qn("xlink", "type"): "simple",
             _qn("xlink", "href"): href,
         },
-        nsmap={"xlink": NS["xlink"]},
     )
     link.text = payload
     return link
 
 
 # ---------------------------------------------------------------------------
-# Inline token handling
+# Inline token handling (paragraph-level)
 # ---------------------------------------------------------------------------
 
 
-def _handle_inline_tokens(element: etree._Element, attr: str, state: _State) -> None:
-    """Replace ``{{ }}``/``{% %}``/``{# #}`` tokens inside ``element.<attr>``.
+def _handle_inline_paragraph(paragraph: etree._Element, state: _State) -> None:
+    """Replace ``{{ }}``/``{% %}``/``{# #}`` tokens inside a paragraph.
 
-    ``attr`` is ``"text"`` (the element's leading text) or ``"tail"`` (text
-    following a child element). The function splices the original string into
-    pre-token text + emitted-element-node + post-token text across multiple
-    tokens.
+    Operates on the paragraph's *flattened* text (concatenation of ``.text``,
+    each child's ``.text`` and ``.tail``) rather than per-element ``.text``/
+    ``.tail`` strings. This is necessary because LibreOffice inserts
+    ``<text:span>`` formatting runs in the middle of a token the author
+    typed (autocorrect, spell-checking,IME composition, ...) and a
+    per-element tokenizer would see broken-up tokens it cannot recognise.
+
+    When tokens are present in a paragraph, the paragraph's children are
+    cleared and rebuilt as: literal-text-children (no internal styling —
+    spans inside a token lose their formatting, which is semantically
+    correct since py3o user-field substitution produces a single value
+    with no internal styling anyway) interleaved with emitted element
+    nodes (``<text:user-field-get>`` / ``<text:a>``).
+
+    Paragraphs with no tokens are left untouched, preserving the author's
+    formatting verbatim.
+
+    Tokens that span multiple paragraphs (``{{`` opened in one paragraph
+    without a matching ``}}``) are reported as errors at lint time — the
+    author must keep each token within a single paragraph.
     """
-    text = getattr(element, attr)
-    if not text:
+    full_text = "".join(paragraph.itertext())
+    if not full_text:
         return
-
-    tokens = tokenize(text)
+    tokens = tokenize(full_text)
     if not tokens:
-        return
+        return  # No tokens: leave formatting untouched.
 
-    # Build a list of (kind, content) chunks: 'text' chunks carry literal
-    # text; 'element' chunks carry an lxml element to insert as a sibling.
+    # Build a flat chunk list: ("text", literal) and ("element", lxml).
     chunks: list[tuple[str, object]] = []
     cursor = 0
+    had_token_breaking_internal_span = False
     for tok in tokens:
         if tok.start > cursor:
-            chunks.append(("text", text[cursor : tok.start]))
+            chunks.append(("text", full_text[cursor : tok.start]))
         if tok.kind == "comment":
-            # Drop entirely; do not append an element chunk.
+            # Drop entirely.
             pass
         elif tok.kind == "var":
             el = _make_user_field_get(tok.body.strip(), state)
@@ -372,69 +390,116 @@ def _handle_inline_tokens(element: etree._Element, attr: str, state: _State) -> 
             if el is not None:
                 chunks.append(("element", el))
         cursor = tok.end
-    if cursor < len(text):
-        chunks.append(("text", text[cursor:]))
+    if cursor < len(full_text):
+        chunks.append(("text", full_text[cursor:]))
 
-    # Early-exit optimization: if no substitutions / directives were emitted
-    # (i.e. only comments — or no tokens at all), still rewrite the text so
-    # comments are stripped. Tokens-only-no-changes is handled at the
-    # function's top-level early-exit (``if not tokens: return``).
+    # If only text survived (comments-only or all-var-rejected), still
+    # rebuild so the comments are stripped.
     has_element = any(c[0] == "element" for c in chunks)
-    if not has_element:
-        # Rebuild text by concatenating only ``text`` chunks; comments drop.
-        rebuilt = "".join(c[1] for c in chunks if c[0] == "text")
-        setattr(element, attr, rebuilt)
-        return
+    if has_element:
+        # Detect whether the original paragraph had any child elements
+        # *inside* a token range — i.e. spans that were flattened. This is
+        # informational; the author may want to know.
+        if _paragraph_had_spans_inside_tokens(paragraph, tokens):
+            state.issues.append(
+                Issue(
+                    "info",
+                    "Formatting runs inside a token were flattened during "
+                    "compilation. The substituted value will inherit the "
+                    "paragraph's base style.",
+                    _paragraph_location(paragraph),
+                )
+            )
+        # Clear the paragraph and rebuild.
+        for child in list(paragraph):
+            paragraph.remove(child)
+        paragraph.text = None
 
-    first_text = ""
-    first_text_set = False
-    last_elem: etree._Element | None = None
-    pending_text = ""
-
-    for kind, content in chunks:
-        if kind == "text":
-            if not first_text_set:
-                first_text += content
-            else:
-                pending_text += content
-        else:  # element
-            if not first_text_set:
-                # First element: emit leading text first.
-                setattr(element, attr, first_text)
-                first_text_set = True
-            else:
-                if last_elem is not None:
-                    last_elem.tail = pending_text
-                pending_text = ""
-            # Insert the element relative to its anchor.
-            _attach_element(element, attr, content)
-            last_elem = content
-
-    # Trailing text after the last element becomes its tail.
-    if last_elem is not None:
-        last_elem.tail = pending_text
-
-    # If every chunk was 'text' (comments only), update the attribute.
-    if not first_text_set:
-        setattr(element, attr, first_text)
-
-
-def _attach_element(parent: etree._Element, attr: str, child: etree._Element) -> None:
-    """Insert ``child`` immediately after the appropriate anchor.
-
-    For ``attr == "text"`` the child becomes a direct child of ``parent``
-    (appended after existing children, but conceptually it follows the
-    paragraph's leading text).
-
-    For ``attr == "tail"`` the child is inserted after ``parent`` as a sibling
-    (in parent's parent).
-    """
-    if attr == "text":
-        parent.append(child)
+        # Reconstruct: first leading text becomes paragraph.text; subsequent
+        # text becomes the tail of the last appended element.
+        first_text = ""
+        first_elem_seen = False
+        last_elem: etree._Element | None = None
+        pending_text = ""
+        for kind, content in chunks:
+            if kind == "text":
+                if not first_elem_seen:
+                    first_text += content  # type: ignore[operator]
+                else:
+                    pending_text += content  # type: ignore[operator]
+            else:  # element
+                if not first_elem_seen:
+                    paragraph.text = first_text
+                    first_elem_seen = True
+                else:
+                    if last_elem is not None:
+                        last_elem.tail = pending_text
+                    pending_text = ""
+                paragraph.append(content)
+                last_elem = content
+        if last_elem is not None:
+            last_elem.tail = pending_text
+        elif not first_elem_seen:
+            # Only comments survived; emit whatever text we rebuilt.
+            paragraph.text = first_text
     else:
-        grand = parent.getparent()
-        if grand is not None:
-            grand.insert(grand.index(parent) + 1, child)
+        # Only comments survived (every var/directive token rejected) —
+        # rebuild text without comments. This still flattens spans, but
+        # we'll only do this if comments were actually stripped.
+        rebuilt = "".join(c[1] for c in chunks if c[0] == "text")
+        if rebuilt != full_text:
+            for child in list(paragraph):
+                paragraph.remove(child)
+            paragraph.text = rebuilt
+
+
+def _paragraph_had_spans_inside_tokens(
+    paragraph: etree._Element, tokens: list
+) -> bool:
+    """Return True iff any child element of ``paragraph`` existed within the
+    character range of a token (i.e. a span was flattened into a token).
+
+    This is a heuristic: we look at the paragraph's children and check
+    whether any of them appears between the start and end of a token in
+    the flattened text. The check is conservative; false positives are
+    acceptable for an informational issue.
+    """
+    if len(paragraph) == 0:
+        return False
+    # Reconstruct (offset, is_in_token) ranges by walking the paragraph in
+    # document order with running offsets.
+    try:
+        offset = 0
+        ranges = []  # list of (start, end, is_text) for each piece
+        if paragraph.text:
+            ranges.append((offset, offset + len(paragraph.text), True))
+            offset += len(paragraph.text)
+        for child in paragraph:
+            if child.text:
+                ranges.append((offset, offset + len(child.text), True))
+                offset += len(child.text)
+            # Element itself takes no characters in flat text.
+            if child.tail:
+                ranges.append((offset, offset + len(child.tail), True))
+                offset += len(child.tail)
+        # Now check whether any element position falls inside a token.
+        char_pos = 0
+        elem_positions = []
+        if paragraph.text:
+            char_pos += len(paragraph.text)
+        for child in paragraph:
+            elem_positions.append(char_pos)  # element starts here
+            if child.text:
+                char_pos += len(child.text)
+            if child.tail:
+                char_pos += len(child.tail)
+        for tok in tokens:
+            for ep in elem_positions:
+                if tok.start < ep < tok.end:
+                    return True
+    except Exception:
+        return False
+    return False
 
 
 def _make_user_field_get(expr: str, state: _State) -> etree._Element | None:
@@ -466,10 +531,15 @@ def _make_user_field_get(expr: str, state: _State) -> etree._Element | None:
         )
     name = f"py3o.{expr}"
     state.user_fields.setdefault(name, expr)  # placeholder hint
+    # NOTE: do NOT pass ``nsmap=`` here. lxml pre-5.x has a serialization
+    # quirk where freshly-created elements with their own nsmap lose their
+    # ``.tail`` text when serialized via ``etree.tostring`` — even though
+    # the in-memory ``.tail`` attribute reads correctly. The element
+    # inherits the parent's namespace bindings upon insertion, so an explicit
+    # nsmap is redundant anyway.
     return etree.Element(
         _qn("text", "user-field-get"),
         attrib={_qn("text", "name"): name},
-        nsmap={"text": NS["text"]},
     )
 
 
@@ -572,7 +642,9 @@ def _emit_user_field_decls(body: etree._Element, state: _State) -> None:
     decls_block = container.find(_qn("text", "user-field-decls"))
     existing_names: set[str] = set()
     if decls_block is None:
-        decls_block = etree.Element(_qn("text", "user-field-decls"), nsmap={"text": NS["text"]})
+        # No nsmap (the parent tree already declares these prefixes; passing
+        # an explicit nsmap would make lxml drop our .tail on serialization).
+        decls_block = etree.Element(_qn("text", "user-field-decls"))
         container.insert(0, decls_block)
     else:
         for decl in decls_block.findall(_qn("text", "user-field-decl")):
@@ -583,7 +655,7 @@ def _emit_user_field_decls(body: etree._Element, state: _State) -> None:
     for name, hint in state.user_fields.items():
         if name in existing_names:
             continue
-        decl = etree.SubElement(
+        etree.SubElement(
             decls_block,
             _qn("text", "user-field-decl"),
             attrib={
@@ -591,7 +663,4 @@ def _emit_user_field_decls(body: etree._Element, state: _State) -> None:
                 _qn("office", "string-value"): hint,
                 _qn("text", "name"): name,
             },
-            nsmap={"text": NS["text"], "office": NS["office"]},
         )
-        # Reorder: lxml's SubElement appends at end which is fine.
-        _ = decl  # silence unused-variable linters

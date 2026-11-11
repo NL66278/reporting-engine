@@ -136,6 +136,45 @@ def test_comments_are_dropped():
     print("test_comments_are_dropped OK")
 
 
+def test_token_split_across_format_runs():
+    """A ``{{ }}`` token whose body contains formatting spans (e.g.
+    LibreOffice auto-splitting ``create_date`` into ``create`` + ``<span>_</span>``
+    + ``d`` + ``<span>ate</span>``) must still be compiled into a single py3o
+    user-field-get element.
+
+    Regression test for the contacts_and_children.odt incident where
+    ``{{ o_format_date(object.create_date) }}`` was printed literally because
+    LibreOffice inserted spans inside the expression."""
+    body = (
+        # Mimic LibreOffice's split of create_date across spans.
+        '<text:p text:style-name="P1">Created {{ o_format_date(object.create'
+        '<text:span text:style-name="T1">_</text:span>'
+        'd<text:span text:style-name="T1">ate</text:span>) }}.</text:p>'
+    )
+    src = _build_minimal_odt(body)
+    out = preprocess(src, "odt")
+    # Extract content.xml from the compiled .odt zip.
+    import io, zipfile
+    with zipfile.ZipFile(io.BytesIO(out), "r") as zf:
+        content_xml = zf.read("content.xml")
+    from lxml import etree
+    tree = etree.fromstring(content_xml)
+    ns = {"text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0"}
+    names = [el.get("{%s}name" % ns["text"]) for el in tree.iter("{%s}user-field-get" % ns["text"])]
+    assert "py3o.o_format_date(object.create_date)" in names, names
+    # No leftover literal token fragments in the body text.
+    body_text = "".join(t.text or "" for t in tree.iter() if t.text)
+    assert "{{" not in body_text, body_text
+    assert "}}" not in body_text, body_text
+    # And the surrounding plain text is preserved (inside content.xml).
+    import io, zipfile as _zf
+    with _zf.ZipFile(io.BytesIO(out), "r") as zf:
+        content_bytes = zf.read("content.xml")
+    assert b"Created " in content_bytes
+    assert b"." in content_bytes  # trailing dot
+    print("test_token_split_across_format_runs OK")
+
+
 def test_lint_unbalanced_for():
     src = MIN_FODT_TEMPLATE.format(
         tokens_var="{{ x }}",
@@ -307,6 +346,7 @@ def main():
     test_if_emit()
     test_function_directive()
     test_comments_are_dropped()
+    test_token_split_across_format_runs()
     test_lint_unbalanced_for()
     test_lint_refuses_elif()
     test_py3o_accepts_compiled_template()
