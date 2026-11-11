@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- Copyright 2026 Open Eye Development
+     License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl). -->
+<odoo>
+    <!-- Add a "Source template" field above the stock py3o_template_data
+         binary field, plus a status widget showing whether preprocessing
+         succeeded or errored on the last compile. -->
+    <record id="py3o_template_form_preprocessor" model="ir.ui.view">
+        <field name="name">py3o.template.form.preprocessor</field>
+        <field name="model">py3o.template</field>
+        <field name="inherit_id" ref="report_py3o.py3o_template_configuration_form_view"/>
+        <field name="arch" type="xml">
+            <data>
+                <!-- Header with recompile + diagnostic actions -->
+                <xpath expr="//form" position="inside">
+                    <header>
+                        <button name="action_recompile"
+                                type="object"
+                                string="Recompile"
+                                class="oe_highlight"
+                                invisible="not source_template_data"/>
+                        <button name="action_show_diagnostics"
+                                type="object"
+                                string="Diagnostics"
+                                invisible="not preprocessor_issues"/>
+                    </header>
+                </xpath>
+
+                <!-- Source template + status, BEFORE the compiled binary field -->
+                <xpath expr="//group[@name='main']/field[@name='py3o_template_data']" position="before">
+                    <separator string="Source template (Jinja2-style)"/>
+                    <group name="preprocessor_source">
+                        <field name="source_template_data"
+                               filename="source_template_filename"
+                               placeholder="Upload a LibreOffice .odt with {{ var }} and {% for/if %} tokens"/>
+                        <field name="source_template_filename" invisible="1"/>
+                        <field name="preprocessor_status"
+                               widget="badge"
+                               decoration-success="preprocessor_status == 'ok'"
+                               decoration-danger="preprocessor_status == 'error'"
+                               decoration-secondary="preprocessor_status == 'empty'"
+                               nolabel="0"/>
+                    </group>
+                    <separator string="Compiled template (py3o-ready — auto-generated)"/>
+                    <group name="preprocessor_compiled">
+                        <field name="preprocessor_issues"
+                               widget="text"
+                               placeholder="Last-compile diagnostics appear here. Empty when preprocessing succeeded cleanly."
+                               invisible="not preprocessor_issues"/>
+                    </group>
+                </xpath>
+            </data>
+        </field>
+    </record>
+</odoo>
