@@ -12,6 +12,7 @@ produces a compiled template with the py3o hyperlink + user-field XML that
 The library is intentionally standalone so it can be unit-tested offline and
 later extracted to a dedicated pip package if useful.
 """
+from .aeroo_import import convert_aeroo, convert_aeroo_file
 from .preprocessor import (
     Issue,
     PreprocessError,
@@ -23,6 +24,8 @@ from .preprocessor import (
 __all__ = [
     "Issue",
     "PreprocessError",
+    "convert_aeroo",
+    "convert_aeroo_file",
     "lint",
     "preprocess",
     "preprocess_file",

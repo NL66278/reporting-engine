@@ -188,6 +188,64 @@ each contact's name and creation date (``{{ object.name }}``,
 table guarded by ``{% if object.child_ids %}`` with an inner
 ``{% for child in object.child_ids %}``.
 
+Migrating from Aeroo (``report_aeroo``) templates
+==================================================
+
+If you have existing Aeroo report templates (OCA ``report_aeroo``) that
+store dynamic expressions inside ``<text:placeholder>`` elements using
+Genshi-style angle-bracket syntax, the helper at
+``helpers/aeroo_import.py`` converts them into the Jinja2-style source
+format this module compiles. The converter is pure-Python (no Odoo dep)
+and reuses :mod:`helpers.odt_io` for the ``.odt`` zip handling.
+
+Translation table:
+
+============================  ============================================
+Aeroo (inside ``< … >``)     py3o preprocessor source
+============================  ============================================
+``objects[0].field``          ``{{ objects[0].field }}``
+``o.field``                   ``{{ objects[0].field }}``  (single-record alias)
+``for each="x in xs"``        ``{% for x in xs %}``
+``/for``                      ``{% endfor %}``
+``if test="cond"``            ``{% if cond %}``
+``/if``                      ``{% endif %}``
+``setLang('xx_XX')``          ``{# … dropped: py3o has no setLang; use
+                              o_format_lang(value, lang_code=…) #}``
+``formatLang(expr)``         ``{{ o_format_lang(expr) }}``
+``<any other expr>``          ``{{ <any other expr> }}``
+``<<expr>>`` (typo)           ``{{ expr }}``  (lint flags the strip)
+============================  ============================================
+
+``<choose>``/``<when test="…">``/``<otherwise>`` have no py3o equivalent —
+the converter refuses them with a warning and leaves the placeholder in
+place for you to refactor as nested ``{% if %}`` blocks.
+
+CLI / library use::
+
+    # From Python:
+    from helpers.aeroo_import import convert_aeroo, convert_aeroo_file
+
+    converted_bytes, issues = convert_aeroo(template_bytes, "odt")
+    # OR: convert a file on disk → writes foo.src.odt next to foo.odt
+    written_path, issues = convert_aeroo_file("/path/to/template.odt")
+
+    # ``issues`` is a list of helpers.preprocessor.Issue records.
+    # severity == "error"  → conversion could not complete (e.g. invalid XML)
+    # severity == "warning" → a construct was refused (e.g. choose/when); the
+    #                        placeholder is left in place for manual refactoring
+    # severity == "info"    → an automatic rewrite happened (e.g. o.→objects[0].,
+    #                        stray double-bracket stripped); review the diff
+
+    # Then feed the converted source through the normal preprocessor:
+    from helpers.preprocessor import preprocess, lint
+    lint_issues = lint(converted_bytes, "odt")   # check before compiling
+    compiled = preprocess(converted_bytes, "odt")  # → py3o-ready .odt
+
+The converted ``foo.src.odt`` opens cleanly in LibreOffice (tokens appear
+as plain editable text) and is the right format to upload into a
+``py3o.template`` record's **Source Template** field or to reference via
+``py3o_template_fallback`` with the ``.src.`` filename convention.
+
 Tests
 =====
 
@@ -195,14 +253,23 @@ The pure-Python preprocessor library lives under ``helpers/`` and has no
 Odoo dependency. Unit tests run against Python 3.13 + lxml + ``py3o.template``::
 
     cd report_py3o_preprocessor
-    python tests/test_preprocessor.py
+    python tests/test_preprocessor.py     # preprocessor + tokenizer
+    python tests/test_aeroo_import.py     # Aeroo → preprocessor source
 
-Expect ``ALL TESTS PASSED``. Tests cover tokenizer behaviour, the block rule,
-each token kind (``{{ }}``/``{% for %}``/``{% if %}``/``{% function %}``/``{# #}``),
-unbalanced-directive detection, the ``{% elif %}`` refusal, a regression test
-for ``{{ … }}`` tokens split across ``<text:span>`` formatting runs (LibreOffice
-autocorrect), and an end-to-end acceptance test that feeds the compiled
-``.odt`` to ``py3o.template.Template.get_all_user_python_expression()``.
+Expect ``ALL TESTS PASSED``. Preprocessor tests cover tokenizer behaviour,
+the block rule, each token kind (``{{ }}``/``{% for %}``/``{% if %}``/
+``{% function %}``/``{# #}``), unbalanced-directive detection, the
+``{% elif %}`` refusal, a regression test for ``{{ … }}`` tokens split
+across ``<text:span>`` formatting runs (LibreOffice autocorrect), and an
+end-to-end acceptance test that feeds the compiled ``.odt`` to
+``py3o.template.Template.get_all_user_python_expression()``.
+
+Aeroo-importer tests cover each translation-table row (variable
+substitution, the ``o.`` alias rewrite + its non-overmatching guard, the
+``for each=``/``if test=``/closings, ``setLang`` drop-to-comment,
+``formatLang`` rename, the stray-double-bracket typo, ``choose``/``when``/
+``otherwise`` refusal, tail-text preservation, and a file round-trip that
+exercises the full Aeroo → source → compiled py3o pipeline).
 
 Licensing
 =========
