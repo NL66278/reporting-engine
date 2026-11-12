@@ -292,6 +292,107 @@ def _build_minimal_odt(content_xml_body: str) -> bytes:
     return out.getvalue()
 
 
+def test_styles_header_tokens_are_compiled():
+    """A ``{{ … }}`` token (or any Jinja directive) typed in a page header —
+    which ODF stores in ``styles.xml``, not ``content.xml`` — MUST compile to
+    a py3o user-field-get inside that header, and py3o MUST pick it up via
+    ``get_all_user_python_expression`` (which scans all templated_files).
+
+    Regression test for the foei report incident: an
+    ``{{objects[0].project_id.reference}}`` token placed in the page header
+    was silently left as plain literal text in the compiled .odt because the
+    preprocessor only walked ``content.xml``.
+    """
+    import io
+    import shutil
+    import tempfile
+    import zipfile
+    from pathlib import Path
+
+    # Build a minimal .odt whose styles.xml carries a Jinja token in the header.
+    mimetype = b"application/vnd.oasis.opendocument.text"
+    manifest = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<manifest:manifest xmlns:manifest='
+        '"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">'
+        '<manifest:file-entry manifest:media-type='
+        '"application/vnd.oasis.opendocument.text" manifest:full-path="/"/>'
+        '<manifest:file-entry manifest:media-type="text/xml" manifest:full-path="content.xml"/>'
+        '<manifest:file-entry manifest:media-type="text/xml" manifest:full-path="styles.xml"/>'
+        '</manifest:manifest>'
+    ).encode("utf-8")
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<office:document-styles '
+        'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+        'office:version="1.2">'
+        '<office:master-styles>'
+        '<style:master-page style:name="Standard" style:page-layout-name="M1">'
+        '<style:header>'
+        '<text:p>Reference: {{ objects[0].project_id.reference }}</text:p>'
+        '</style:header>'
+        '</style:master-page>'
+        '</office:master-styles>'
+        '</office:document-styles>'
+    ).encode("utf-8")
+    content = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<office:document-content '
+        'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+        'xmlns:xlink="http://www.w3.org/1999/xlink" '
+        'office:version="1.2">'
+        '<office:body><office:text>'
+        '<text:p>Body: {{ objects[0].body_field }}</text:p>'
+        '</office:text></office:body></office:document-content>'
+    ).encode("utf-8")
+
+    src_odt = io.BytesIO()
+    with zipfile.ZipFile(src_odt, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        mt = zipfile.ZipInfo("mimetype")
+        mt.compress_type = zipfile.ZIP_STORED
+        zf.writestr(mt, mimetype)
+        for name, raw in [
+            ("META-INF/manifest.xml", manifest),
+            ("styles.xml", styles),
+            ("content.xml", content),
+        ]:
+            zi = zipfile.ZipInfo(name)
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(zi, raw)
+    src = src_odt.getvalue()
+
+    compiled = preprocess(src, "odt")
+
+    # The header token must now be a <text:user-field-get> INSIDE styles.xml.
+    with zipfile.ZipFile(io.BytesIO(compiled), "r") as zf:
+        compiled_styles = zf.read("styles.xml")
+    from lxml import etree
+    ns = {"text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0"}
+    tree = etree.fromstring(compiled_styles)
+    field_names = [el.get("{%s}name" % ns["text"])
+                    for el in tree.iter("{%s}user-field-get" % ns["text"])]
+    assert "py3o.objects[0].project_id.reference" in field_names, field_names
+    # No leftover literal ``{{`` in the header.
+    assert b"{{" not in compiled_styles, compiled_styles
+
+    # And py3o itself picks up the header expression across templates files.
+    workdir = tempfile.mkdtemp(prefix="py3o_style_pre_")
+    try:
+        cpath = Path(workdir) / "c.odt"
+        cpath.write_bytes(compiled)
+        from py3o.template import Template
+        t = Template(str(cpath), str(cpath.with_suffix(".o.odt")))
+        expressions = t.get_all_user_python_expression()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    assert "objects[0].body_field" in expressions, expressions
+    assert "objects[0].project_id.reference" in expressions, expressions
+    print("test_styles_header_tokens_are_compiled OK")
+
+
 def test_py3o_accepts_compiled_template():
     """End-to-end: build a minimal .odt zip with Jinja tokens, preprocess it,
     then feed the compiled .odt to ``py3o.template.Template`` and confirm the
@@ -349,6 +450,7 @@ def main():
     test_token_split_across_format_runs()
     test_lint_unbalanced_for()
     test_lint_refuses_elif()
+    test_styles_header_tokens_are_compiled()
     test_py3o_accepts_compiled_template()
     print("\nALL TESTS PASSED")
 

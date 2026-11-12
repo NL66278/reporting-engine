@@ -92,6 +92,71 @@ def _extract_content_xml(odt_bytes: bytes) -> bytes:
         return zf.read("content.xml")
 
 
+def _extract_styles_xml(odt_bytes: bytes) -> bytes:
+    with zipfile.ZipFile(io.BytesIO(odt_bytes), "r") as zf:
+        return zf.read("styles.xml")
+
+
+def _build_minimal_odt_with_header(content_xml_body: str, header_body: str) -> bytes:
+    """Like :func:`_build_minimal_odt` but puts ``header_body`` inside a
+    ``<style:header>`` in styles.xml — the ODF location for page headers and
+    footers (where Ronald's foei template keeps its ``objects[0].project_id.reference``
+    expression)."""
+    from html import escape as _escape
+
+    mimetype = b"application/vnd.oasis.opendocument.text"
+    manifest = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<manifest:manifest xmlns:manifest='
+        '"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">'
+        '<manifest:file-entry manifest:media-type='
+        '"application/vnd.oasis.opendocument.text" manifest:full-path="/"/>'
+        '<manifest:file-entry manifest:media-type="text/xml" manifest:full-path="content.xml"/>'
+        '<manifest:file-entry manifest:media-type="text/xml" manifest:full-path="styles.xml"/>'
+        '</manifest:manifest>'
+    ).encode("utf-8")
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<office:document-styles '
+        'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+        'office:version="1.2">'
+        '<office:master-styles>'
+        '<style:master-page style:name="Standard" style:page-layout-name="M1">'
+        '<style:header>' + header_body + '</style:header>'
+        '</style:master-page>'
+        '</office:master-styles>'
+        '</office:document-styles>'
+    ).encode("utf-8")
+    content = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<office:document-content '
+        'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+        'xmlns:xlink="http://www.w3.org/1999/xlink" '
+        'office:version="1.2">'
+        '<office:body><office:text>'
+        + content_xml_body
+        + '</office:text></office:body></office:document-content>'
+    ).encode("utf-8")
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        mt = zipfile.ZipInfo("mimetype")
+        mt.compress_type = zipfile.ZIP_STORED
+        zf.writestr(mt, mimetype)
+        for name, raw in [
+            ("META-INF/manifest.xml", manifest),
+            ("styles.xml", styles),
+            ("content.xml", content),
+        ]:
+            zi = zipfile.ZipInfo(name)
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(zi, raw)
+    return out.getvalue()
+
+
 def _parse_links(out: bytes):
     """Return list of (unquoted_href, visible_text) for every <text:a>."""
     from urllib.parse import unquote
@@ -315,6 +380,65 @@ def test_choose_refused():
     print("test_choose_refused OK")
 
 
+def test_placeholder_in_styles_header():
+    """Aeroo placeholders inside ``<style:header>`` (in styles.xml, not
+    content.xml) MUST be converted too — ODF puts page headers/footers there.
+
+    Reproduces the foei incident: an Aeroo ``<objects[0].project_id.reference>``
+    in the page header was silently skipped by the converter, so py3o never saw
+    the expression. Worse, the preprocessor ALSO only touched content.xml, so
+    even if Ronald had hand-written the Jinja token in the header it would
+    have been left as plain literal text in the compiled .odt.
+
+    Both helpers must walk styles.xml in addition to content.xml."""
+    header_body = f'<text:p>Reference: {_ph("objects[0].project_id.reference")}</text:p>'
+    content_body = f'<text:p>Body: {_ph("objects[0].body_field")}</text:p>'
+    src = _build_minimal_odt_with_header(content_body, header_body)
+
+    converted, issues = convert_aeroo(src, "odt")
+    errors = [i for i in issues if i.severity == "error"]
+    assert not errors, errors
+
+    new_styles = _extract_styles_xml(converted).decode("utf-8")
+    new_content = _extract_content_xml(converted).decode("utf-8")
+
+    # Both placeholders were converted, regardless of which XML file they sat in.
+    assert b"{{ objects[0].body_field }}" in _extract_content_xml(converted)
+    assert "{{ objects[0].project_id.reference }}" in new_styles, new_styles
+    # No leftover Aeroo placeholders anywhere.
+    assert "<text:placeholder" not in new_styles
+    assert "<text:placeholder" not in new_content
+
+    # Full pipeline: preprocessor must ALSO walk styles.xml so the Jinja
+    # token in the header compiles to a py3o user-field-get there.
+    compiled = preprocess(converted, "odt")
+    from lxml import etree
+    ns = {"text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0"}
+
+    # user-field-GET elements appear in BOTH content.xml AND styles.xml
+    compiled_styles = _extract_styles_xml(compiled)
+    styles_tree = etree.fromstring(compiled_styles)
+    styles_field_gets = [el.get("{%s}name" % ns["text"])
+                          for el in styles_tree.iter("{%s}user-field-get" % ns["text"])]
+    assert "py3o.objects[0].project_id.reference" in styles_field_gets, styles_field_gets
+
+    # And py3o itself picks up the header expression via get_all_user_python_expression
+    # (which scans all templated_files: content.xml + styles.xml + manifest.xml).
+    import shutil, tempfile
+    from py3o.template import Template
+    workdir = tempfile.mkdtemp(prefix="aeroo_header_")
+    try:
+        cpath = Path(workdir) / "c.odt"
+        cpath.write_bytes(compiled)
+        t = Template(str(cpath), str(cpath.with_suffix(".o.odt")))
+        expressions = t.get_all_user_python_expression()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    assert "objects[0].body_field" in expressions, expressions
+    assert "objects[0].project_id.reference" in expressions, expressions
+    print("test_placeholder_in_styles_header OK")
+
+
 def test_preserves_surrounding_text_and_tail():
     """The placeholder's tail text and sibling structure survive the rewrite."""
     body = (
@@ -368,6 +492,7 @@ def main():
     test_formatlang_rename()
     test_double_bracket_typo()
     test_choose_refused()
+    test_placeholder_in_styles_header()
     test_preserves_surrounding_text_and_tail()
     test_file_roundtrip()
     print("\nALL TESTS PASSED")

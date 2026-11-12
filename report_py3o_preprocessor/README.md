@@ -97,6 +97,21 @@ with the py3o link element). This lets you write::
 and it correctly produces a standalone py3o "for" link paragraph — no special
 LibreOffice formatters required. ``{{ … }}`` and ``{# … #}`` are always inline.
 
+Page headers/footers (styles.xml, not content.xml)
+===================================================
+
+ODF stores page headers and footers in ``styles.xml`` (under
+``<office:master-styles>``/``<style:master-page>``/``<style:header>``/
+``<style:footer>``), not in ``content.xml``. Both the preprocessor and the
+Aeroo importer walk ``styles.xml`` in addition to ``content.xml`` so tokens
+you author in a page header — e.g. ``{{ objects[0].project_id.reference }}``
+in a "Reference number" header line — compile to py3o user-field-gets inside
+the header. py3o's :meth:`get_all_user_python_expression` scans all
+templated files (``content.xml`` + ``styles.xml`` + ``META-INF/manifest.xml``)
+so the header expression is picked up at render time without further work.
+User-field declarations are emitted in ``content.xml`` only (one place
+suffices; py3o connects them across files).
+
 Formatting runs inside tokens (LibreOffice autocorrect)
 =======================================================
 

@@ -248,6 +248,19 @@ def convert_aeroo(data: bytes, src_format: str = "odt") -> tuple[bytes, list[Iss
     state = _ConvertState()
     try:
         new_content = _transform(content_xml, state)
+        # ODF keeps page headers/footers in styles.xml, NOT in content.xml —
+        # Aeroo placeholders can legitimately live there (the foei template
+        # has one for ``objects[0].project_id.reference`` in the page header).
+        # Process styles.xml the same way; py3o's
+        # ``get_all_user_python_expression`` scans all templated_files
+        # (content.xml + styles.xml + manifest.xml), so emits placed here are
+        # picked up at render time without further work.
+        new_extras: list[tuple[str, bytes]] = []
+        for name, raw in extras:
+            if name == "styles.xml":
+                raw = _transform(raw, state)
+            new_extras.append((name, raw))
+        extras = new_extras
     except etree.XMLSyntaxError as exc:
         state.issues.insert(
             0, Issue("error", f"Aeroo source contains invalid XML: {exc}", "")

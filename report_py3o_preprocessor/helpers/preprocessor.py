@@ -122,6 +122,19 @@ def preprocess(data: bytes, src_format: str = "odt") -> bytes:
     state = _State()
     try:
         new_content = _transform_content(content_xml, state)
+        # styles.xml holds page headers/footers. Walk it too so Jinja tokens
+        # in headers (e.g. ``{{ objects[0].project_id.reference }}`` in a page
+        # header) compile to py3o user-field-gets inside the header. py3o's
+        # ``get_all_user_python_expression`` scans ALL templated files —
+        # content.xml + styles.xml + manifest.xml — so emits placed in the
+        # header are picked up at render time; we don't need to repeat the
+        # user-field-decl block here (decls already in content.xml suffice).
+        new_extras: list[tuple[str, bytes]] = []
+        for name, raw in extra_files:
+            if name == "styles.xml":
+                raw = _transform_styles(raw, state)
+            new_extras.append((name, raw))
+        extra_files = new_extras
     except etree.XMLSyntaxError as exc:
         raise PreprocessError(f"Source template contains invalid XML: {exc}") from exc
 
@@ -165,10 +178,15 @@ def lint(data: bytes, src_format: str = "odt") -> list[Issue]:
     """Return diagnostics for a source template without writing a compiled one."""
     from .odt_io import load
 
-    content_xml, _mt, _extra = load(data, src_format)
+    content_xml, _mt, extra_files = load(data, src_format)
     state = _State()
     try:
         _transform_content(content_xml, state)
+        # Same styles.xml walk as ``preprocess`` so lint reports issues in
+        # page headers/footers too (e.g. unterminated ``{% if %}`` in a header).
+        for name, raw in extra_files:
+            if name == "styles.xml":
+                _transform_styles(raw, state)
     except etree.XMLSyntaxError as exc:
         return [Issue("error", f"Source template contains invalid XML: {exc}", "")]
     return state.issues
@@ -182,57 +200,79 @@ def lint(data: bytes, src_format: str = "odt") -> list[Issue]:
 def _transform_content(content_xml: bytes, state: _State) -> bytes:
     """Walk the content.xml tree, replacing tokens with py3o markup.
 
-    Returns the new content.xml bytes.
+    Returns the new content.xml bytes. Raises :class:`PreprocessError` if the
+    document has no ``<office:body>`` (malformed OpenDocument).
     """
     parser = etree.XMLParser(remove_blank_text=False)
     tree = etree.fromstring(content_xml, parser=parser)
-    _transform_tree(tree, state)
-    return etree.tostring(tree, xml_declaration=True, encoding="UTF-8")
-
-
-def _transform_tree(root: etree._Element, state: _State) -> None:
-    body = _find_body(root)
+    body = _find_body(tree)
     if body is None:
         raise PreprocessError(
             "Template has no <office:body> — is this a valid OpenDocument?"
         )
-
-    # Two passes so that decls collected during inline substitution are
-    # written before the tree is re-serialized.
-
-    # 1. Block-rule: paragraphs that are *only* a single directive become a
-    #    py3o hyperlink element inside that paragraph (all other children/text
-    #    dropped). This catches the common Liquid-style usage:
-    #        <text:p>{% for x in xs %}</text:p>
-    #    Block-rules run BEFORE inline replacement because we inspect the
-    #    paragraph's full concatenated text, and any inline ``{{ }}`` present
-    #    inside such a "directive-only" paragraph is itself an error (the
-    #    author meant for the directive to sit alone).
-    for paragraph in list(body.iter(_qn("text", "p"))) + list(body.iter(_qn("text", "h"))):
-        _handle_block_directive_paragraph(paragraph, state)
-
-    # 2. Inline replacement: walk every paragraph (``<text:p>`` / ``<text:h>``)
-    #    and operate on the *flattened* text of the whole paragraph, not the
-    #    per-element ``.text``/``.tail`` strings. This is intentional and
-    #    necessary: LibreOffice frequently inserts ``<text:span>`` formatting
-    #    runs *inside* a token the author typed — e.g. marking up an
-    #    autocorrected ``_`` or a spell-check suggestion — which would split
-    #    a ``{{ create_date }}`` token across multiple XML elements and break
-    #    any per-element tokenizer. By concatenating the paragraph's full text
-    #    first, we see the tokens as the author intended. The cost is that
-    #    formatting runs *inside* a token (which carry no semantic meaning for
-    #    a substituted value anyway) are flattened; formatting on literal
-    #    text around tokens is preserved (paragraph is rewritten only when
-    #    tokens are present).
-    for paragraph in list(body.iter(_qn("text", "p"))) + list(body.iter(_qn("text", "h"))):
-        _handle_inline_paragraph(paragraph, state)
-
-    # 3. Forward block-direction balance check (raise lint issues for
-    #    unterminated ``{% for %}``/``{% if %}``).
+    _walk_paragraphs(body, state)
+    # Forward block-direction balance check (raise lint issues for
+    # unterminated ``{% for %}``/``{% if %}`` within this tree).
     _check_directive_balance(body, state)
-
-    # 4. Emit collected user-field declarations.
+    # Emit collected user-field declarations into the body's <office:text>.
     _emit_user_field_decls(body, state)
+    return etree.tostring(tree, xml_declaration=True, encoding="UTF-8")
+
+
+def _transform_styles(styles_xml: bytes, state: _State) -> bytes:
+    """Walk styles.xml — page headers/footers live here, outside
+    ``<office:body>``. Applies the same block-rule + inline token handling as
+    :func:`_transform_content`, but emits no user-field-decl block (the decls
+    already in content.xml suffice; py3o scans all templated_files for the
+    matching ``<text:user-field-get>`` references) and runs its own
+    per-tree directive-balance check.
+
+    Returning the modified bytes is the caller's responsibility (the
+    ``styles.xml`` zip member stays in the ``extras`` list).
+    """
+    parser = etree.XMLParser(remove_blank_text=False)
+    tree = etree.fromstring(styles_xml, parser=parser)
+    _walk_paragraphs(tree, state)
+    # Per-tree balance check only. Cross-tree unbalanced cases (e.g. a
+    # ``{% for %}`` in a page header with its ``{% endfor %}`` in the body)
+    # are unusual but legitimate authoring patterns; we don't try to merge
+    # balance state across the two trees.
+    _check_directive_balance(tree, state)
+    return etree.tostring(tree, xml_declaration=True, encoding="UTF-8")
+
+
+def _walk_paragraphs(container: etree._Element, state: _State) -> None:
+    """Apply the block rule and the inline token replacer to every
+    ``<text:p>``/``<text:h>`` under ``container``.
+
+    Two passes so that decls collected during inline substitution are
+    available before the tree is re-serialized by the caller:
+
+    1. **Block-rule**: paragraphs whose *only* non-whitespace content is a
+       single ``{% ... %}`` directive become a py3o hyperlink element inside
+       that paragraph (all other children/text dropped). This catches the
+       common Liquid-style usage::
+
+           <text:p>{% for x in xs %}</text:p>
+
+       Block-rules run BEFORE inline replacement because we inspect the
+       paragraph's full concatenated text, and any inline ``{{ }}`` present
+       inside such a "directive-only" paragraph is itself an error (the
+       author meant for the directive to sit alone).
+
+    2. **Inline replacement**: walk every paragraph and operate on the
+       *flattened* text of the whole paragraph, not the per-element
+       ``.text``/``.tail`` strings. LibreOffice frequently inserts
+       ``<text:span>`` formatting runs *inside* a token the author typed
+       (autocorrect, spell-checking, IME recomposition, …); a per-element
+       tokenizer would see broken-up tokens it cannot recognise. See
+       :func:`_handle_inline_paragraph` for the flattening trade-off.
+    """
+    paragraphs = list(container.iter(_qn("text", "p"))) + list(container.iter(_qn("text", "h")))
+    for paragraph in paragraphs:
+        _handle_block_directive_paragraph(paragraph, state)
+    for paragraph in paragraphs:
+        _handle_inline_paragraph(paragraph, state)
 
 
 def _find_body(root: etree._Element) -> etree._Element | None:
